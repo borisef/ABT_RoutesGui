@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# Customized Save outputs
+*_battery.json
+*_inistate.json
+*_trajectory.json
+*_route.png

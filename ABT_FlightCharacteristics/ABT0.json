@@ -1,0 +1,19 @@
+{
+  "_comment": "Aircraft flight characteristics",
+  "Flight_Characteristics":
+  [
+    {
+      
+      "maxRollAngle":       30,
+      "maxRollRate":        10,
+      "maxPitchUpAngle":    20,
+      "maxPitchUpRate":     5,
+      "maxPitchDownAngle":  15,
+      "maxPitchDownRate":   5,
+      "maxSpeed":           55,
+      "maxAccel":           5,
+      "minSpeed":           30,
+      "minAccel":           -5
+    }
+  ]
+}
