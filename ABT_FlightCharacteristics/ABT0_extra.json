@@ -2,5 +2,8 @@
   "BatteryAltitude": 10,
   "BatteryLocation": {"North": 0.0, "East": 0.0},
   "InitialAltitude": 1500,
-  "delta_seconds": 0.01
+  "delta_seconds": 0.01,
+  "loc_delta_X_std": 1.0,
+  "loc_delta_Y_std": 2.0 ,
+  "loc_delta_Z_std": 3.0
 }
