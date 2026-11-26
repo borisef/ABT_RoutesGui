@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import warnings
@@ -369,12 +370,23 @@ def _aircraft_mesh(aircraft_json):
     return mesh_cfg
 
 
-def _build_mesh_transform(mesh_cfg, wing_span):
+def _build_mesh_transform(mesh_cfg, wing_span, body_length=None, ratio=None,
+                          tail_height=None, rescale=False):
     """Compute static transform data for mesh rendering. Returns dict or None.
 
-    Derives scale from real-world wing_span vs mesh landmark span.
-    Derives axis mapping from nose/tail/wing landmark positions.
-    Loads OBJ vertices and builds a subsampled edge list for wireframe rendering.
+    Derives an axis mapping (forward/port/dorsal) from nose/tail/wing landmarks
+    and a mesh->body transform `M_mesh2body`:
+      - rescale=False: a single uniform scale = wing_span / mesh wing span.
+      - rescale=True: independent per-axis scaling so the body matches bodyLength,
+        the wings match wingSpan and the fin matches verticalTailHeight (aspect
+        ratio is intentionally not preserved). Axes whose target size is missing
+        keep their native scale (factor 1.0).
+
+    The wing-root (where the wings meet the body) is placed `ratio` of the body
+    length from the tail when wingsToBodyRatio is given, else derived by projecting
+    the wing midpoint onto the body axis. All coordinate keypoints present in
+    mesh_cfg are collected as landmarks. Loads OBJ vertices and builds a subsampled
+    edge list for wireframe rendering.
     """
     from atraf.mesh_utils import _load_mesh, _faces_to_edges, _subsample_edges
 
@@ -403,18 +415,51 @@ def _build_mesh_transform(mesh_cfg, wing_span):
     # Rows: how each body axis (forward, port, dorsal) is expressed in mesh XYZ frame.
     R_mesh2body = np.array([forward_mesh, port_mesh, dorsal_mesh])  # (3, 3)
 
+    # mesh->body transform: uniform scale, or anisotropic per-axis when rescaling.
+    if rescale:
+        s_body = (body_length / body_mesh) if body_length else 1.0
+        s_span = (wing_span / span_mesh) if wing_span else 1.0
+        vert_mesh = float(np.dot(vtop - tail, dorsal_mesh))
+        s_vert = (tail_height / vert_mesh) if (tail_height and abs(vert_mesh) > 1e-9) else 1.0
+        M_mesh2body = np.diag([s_body, s_span, s_vert]) @ R_mesh2body
+    else:
+        M_mesh2body = scale * R_mesh2body
+
+    # Wing root: along the body per wingsToBodyRatio (0=tail, 1=nose) when given,
+    # else the projection of the wing midpoint onto the body axis.
+    if ratio is not None:
+        wing_root = tail + ratio * (nose - tail)
+    else:
+        wing_mid = 0.5 * (left + right)
+        wing_root = tail + float(np.dot(wing_mid - tail, forward_mesh)) * forward_mesh
+
     verts, faces = _load_mesh(mesh_cfg["mesh_path"])
     verts_centered = verts - cob
 
-    lmk_keys = ["nose", "tail", "left_wing", "right_wing", "tail_top", "center"]
-    lmk_src = [nose, tail, left, right, vtop, cob]
-    lmk_centered = np.array([v - cob for v in lmk_src], dtype=float)  # (6, 3)
+    # Canonical landmarks plus any extra coordinate keypoints in the mesh config
+    # (e.g. horizontal stabilizers), each drawn as a marker in the camera view.
+    canonical_src = {
+        "nose": nose, "tail": tail, "left_wing": left, "right_wing": right,
+        "tail_top": vtop, "center": cob, "wing_root": wing_root,
+    }
+    canonical_source_keys = {"nose", "tail", "left_wing", "right_wing",
+                             "vertical_tail_top", "center_of_body"}
+    extra = {k: np.array(v, float) for k, v in mesh_cfg.items()
+             if k not in canonical_source_keys
+             and isinstance(v, (list, tuple)) and len(v) == 3
+             and all(isinstance(x, (int, float)) for x in v)}
 
-    edges = _subsample_edges(_faces_to_edges(faces))
+    lmk_keys = list(canonical_src.keys()) + list(extra.keys())
+    lmk_src = list(canonical_src.values()) + list(extra.values())
+    lmk_centered = np.array([v - cob for v in lmk_src], dtype=float)  # (K, 3)
+
+    edges = _subsample_edges(_faces_to_edges(faces), max_edges=6000)
 
     return {
         "scale": scale,
+        "M_mesh2body": M_mesh2body,
         "R_mesh2body": R_mesh2body,
+        "cob": cob,
         "verts_centered": verts_centered,
         "lmk_centered": lmk_centered,
         "lmk_keys": lmk_keys,
@@ -422,13 +467,27 @@ def _build_mesh_transform(mesh_cfg, wing_span):
     }
 
 
-def _mesh_project_landmarks(lmk_centered, R_mesh2ENU, traj_ENU, scale,
-                             cam_origin, forward, right, up, intr):
-    """Project the 6 mesh landmarks for all frames. Returns (verts_px, depths) dicts."""
-    # lmk_world: (n_frames, 6, 3)
-    lmk_world = traj_ENU[:, None, :] + scale * np.einsum("fij,nj->fni", R_mesh2ENU, lmk_centered)
+def _rescaled_mesh_cfg(mesh_cfg, M_mesh2body, cob):
+    """Return a copy of mesh_cfg with every coordinate keypoint expressed in the
+    rescaled, body-aligned frame (x=forward, y=port, z=dorsal). Non-coordinate
+    entries (e.g. mesh_path) are copied unchanged."""
+    out = {}
+    for k, v in mesh_cfg.items():
+        if (isinstance(v, (list, tuple)) and len(v) == 3
+                and all(isinstance(x, (int, float)) for x in v)):
+            p = M_mesh2body @ (np.array(v, float) - cob)
+            out[k] = [round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4)]
+        else:
+            out[k] = v
+    return out
 
-    lmk_keys = ["nose", "tail", "left_wing", "right_wing", "tail_top", "center"]
+
+def _mesh_project_landmarks(lmk_centered, lmk_keys, M_mesh2ENU, traj_ENU,
+                             cam_origin, forward, right, up, intr):
+    """Project all mesh landmarks for all frames. Returns (verts_px, depths) dicts."""
+    # lmk_world: (n_frames, K, 3); M_mesh2ENU already folds in the (an)isotropic scale.
+    lmk_world = traj_ENU[:, None, :] + np.einsum("fij,nj->fni", M_mesh2ENU, lmk_centered)
+
     verts_px, depths = {}, {}
     for k, name in enumerate(lmk_keys):
         u, v, d = _project_vertices(lmk_world[:, k, :], cam_origin, forward, right, up, intr)
@@ -520,9 +579,8 @@ def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
     if use_mesh_render:
         from matplotlib.collections import LineCollection
         md_verts = mesh_data["verts_centered"]    # (N, 3)
-        md_R = mesh_data["R_mesh2ENU"]            # (n_all, 3, 3)
+        md_M = mesh_data["M_mesh2ENU"]            # (n_all, 3, 3), folds in scale
         md_traj = mesh_data["traj_ENU"]           # (n_all, 3)
-        md_scale = mesh_data["scale"]
         md_cam = mesh_data["cam_origin"]          # (3,)
         md_edges = mesh_data["edges"]             # (E_sub, 2)
         i_idx = md_edges[:, 0] if len(md_edges) else np.array([], int)
@@ -546,7 +604,7 @@ def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
                 fwd_f, rgt_f, up_f = fwd_f[0], rgt_f[0], up_f[0]
 
                 # Transform all mesh vertices to world ENU for this frame.
-                world_f = md_traj[i] + md_scale * (md_R[i] @ md_verts.T).T  # (N, 3)
+                world_f = md_traj[i] + (md_M[i] @ md_verts.T).T  # (N, 3)
 
                 # Project to camera pixels.
                 diff = world_f - md_cam                          # (N, 3)
@@ -563,13 +621,33 @@ def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
                         pts0 = np.stack([u_f[i_v], v_f[i_v]], axis=1)
                         pts1 = np.stack([u_f[j_v], v_f[j_v]], axis=1)
                         segs = np.stack([pts0, pts1], axis=1)
-                        ax.add_collection(LineCollection(segs, colors="#00e5ff",
-                                                         linewidths=0.5, alpha=0.7))
+                        ax.add_collection(LineCollection(segs, colors="#00bcd4",
+                                                         linewidths=1.0, alpha=1.0,
+                                                         zorder=2))
 
-                ax.plot(verts_px["nose"][i, 0], verts_px["nose"][i, 1],
-                        "o", color="#ff1744", ms=5, label="nose")
-                ax.plot(verts_px["center"][i, 0], verts_px["center"][i, 1],
-                        "o", color="white", ms=3)
+                # Overlay the colored wing/body/fin skeleton so structure is
+                # unmistakable even when the wireframe panels are thin. Wings meet
+                # the body at the wing root, not the center of mass.
+                body = np.array([verts_px["tail"][i], verts_px["nose"][i]])
+                left_wing = np.array([verts_px["wing_root"][i], verts_px["left_wing"][i]])
+                right_wing = np.array([verts_px["wing_root"][i], verts_px["right_wing"][i]])
+                fin = np.array([verts_px["tail"][i], verts_px["tail_top"][i]])
+                ax.plot(body[:, 0], body[:, 1], color="#ffffff", lw=2.2, zorder=4)
+                ax.plot(left_wing[:, 0], left_wing[:, 1], color="#76ff03", lw=2.6, zorder=4)
+                ax.plot(right_wing[:, 0], right_wing[:, 1], color="#ff9100", lw=2.6, zorder=4)
+                ax.plot(fin[:, 0], fin[:, 1], color="#ffd600", lw=2.2, zorder=4)
+
+                # All mesh keypoints: 4 prime points in distinct colors, the rest
+                # (center, fin tip, stabilizers, wing root, ...) in a common gray.
+                prime_colors = {"nose": "#ff1744", "tail": "#2979ff",
+                                "left_wing": "#76ff03", "right_wing": "#ff9100"}
+                for name, pt in verts_px.items():
+                    if name in prime_colors:
+                        continue
+                    ax.plot(pt[i, 0], pt[i, 1], "o", color="#9e9e9e", ms=3, zorder=5)
+                for name, col in prime_colors.items():
+                    ax.plot(verts_px[name][i, 0], verts_px[name][i, 1], "o", color=col,
+                            ms=6, zorder=6, label=name.replace("_", " "))
                 ax.legend(loc="upper right", fontsize=8, facecolor="#222222", labelcolor="white")
             else:
                 body = np.array([verts_px["tail"][i], verts_px["nose"][i]])
@@ -618,13 +696,18 @@ def _join_videos_side_by_side(left_video, right_video, output_video, height=540)
 def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=None,
                           camera=None, aircraft=None, output_json=None,
                           output_video=None, gimbal_video=None, output_combined=None,
-                          schematic_view=True, use_mesh=True):
+                          schematic_view=True, use_mesh=True, rescale=False):
     """Project the aircraft into camera pixels per frame.
 
     When use_mesh=True (default) and the aircraft JSON contains an Aircraft_Mesh
     section with landmark coordinates, the 3D OBJ mesh is loaded, scaled, and
     projected as a wireframe. Otherwise the schematic cross (body + wings + fin)
     is used. Both paths produce the same output format.
+
+    When rescale=True (mesh path only) the mesh is scaled independently per body
+    axis so it matches wingSpan / bodyLength / verticalTailHeight (aspect ratio is
+    not preserved), and a full copy of the aircraft config with the rescaled,
+    body-aligned landmark coordinates is written to XXX_aircraft_rescaled.json.
 
     Inputs (paths or dicts): trajectory (required), camera + aircraft (required),
     battery (camera altitude), gimbal (camera pose; computed from trajectory +
@@ -668,6 +751,14 @@ def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=Non
     intr = _camera_intrinsics(camera)
     wing_span, body_length, ratio, tail_height = _aircraft_schema(aircraft)
 
+    # Raw schema to tell which dimensions are explicitly provided (affects rescale
+    # per-axis factors and whether the wing root uses wingsToBodyRatio).
+    aircraft_data = _load_json(aircraft)
+    schema0 = aircraft_data["Aircraft_Schema"][0] if "Aircraft_Schema" in aircraft_data else aircraft_data
+    ratio_val = float(schema0["wingsToBodyRatio"]) if "wingsToBodyRatio" in schema0 else None
+    target_body = float(schema0["bodyLength"]) if "bodyLength" in schema0 else None
+    target_vert = float(schema0["verticalTailHeight"]) if "verticalTailHeight" in schema0 else None
+
     forward, right, up = _camera_basis(az, el, cam_roll)
 
     # --- Mesh rendering path (use_mesh=True and Aircraft_Mesh with landmarks present) ---
@@ -676,18 +767,20 @@ def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=Non
         if mesh_cfg is not None:
             mt = None
             try:
-                mt = _build_mesh_transform(mesh_cfg, wing_span)
+                mt = _build_mesh_transform(mesh_cfg, wing_span, body_length=target_body,
+                                           ratio=ratio_val, tail_height=target_vert,
+                                           rescale=rescale)
             except (IOError, OSError) as e:
                 warnings.warn(f"Cannot load mesh file ({e}); falling back to schematic.")
             if mt is not None:
                 fwd_a, stb_a, dsl_a = _aircraft_axes(yaw, pitch, roll)
                 # Columns of R_body2ENU are ENU expressions of aircraft body axes.
                 R_body2ENU = np.stack([fwd_a, -stb_a, dsl_a], axis=2)   # (n, 3, 3)
-                R_mesh2ENU = R_body2ENU @ mt["R_mesh2body"]               # (n, 3, 3)
+                M_mesh2ENU = R_body2ENU @ mt["M_mesh2body"]              # (n, 3, 3)
                 traj_ENU = np.stack([X, Y, Z], axis=1)                   # (n, 3)
 
                 verts_px, depths = _mesh_project_landmarks(
-                    mt["lmk_centered"], R_mesh2ENU, traj_ENU, mt["scale"],
+                    mt["lmk_centered"], mt["lmk_keys"], M_mesh2ENU, traj_ENU,
                     cam_origin, forward, right, up, intr)
 
                 offset_px = verts_px["center"] - np.array([intr["cx"], intr["cy"]])
@@ -697,16 +790,12 @@ def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=Non
 
                 frames = []
                 for k, pid in enumerate(ids):
-                    frames.append({
-                        "id": pid,
-                        "nose": [round(float(verts_px["nose"][k, 0]), 2), round(float(verts_px["nose"][k, 1]), 2)],
-                        "tail": [round(float(verts_px["tail"][k, 0]), 2), round(float(verts_px["tail"][k, 1]), 2)],
-                        "left_wing": [round(float(verts_px["left_wing"][k, 0]), 2), round(float(verts_px["left_wing"][k, 1]), 2)],
-                        "right_wing": [round(float(verts_px["right_wing"][k, 0]), 2), round(float(verts_px["right_wing"][k, 1]), 2)],
-                        "tail_top": [round(float(verts_px["tail_top"][k, 0]), 2), round(float(verts_px["tail_top"][k, 1]), 2)],
-                        "center": [round(float(verts_px["center"][k, 0]), 2), round(float(verts_px["center"][k, 1]), 2)],
-                        "visible": bool(visible[k]),
-                    })
+                    fr = {"id": pid}
+                    for name in mt["lmk_keys"]:
+                        fr[name] = [round(float(verts_px[name][k, 0]), 2),
+                                    round(float(verts_px[name][k, 1]), 2)]
+                    fr["visible"] = bool(visible[k])
+                    frames.append(fr)
                 result = {"camera_view": frames}
 
                 if output_json is None:
@@ -716,15 +805,30 @@ def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=Non
                 with open(output_json, "w") as f:
                     json.dump(result, f, indent=2)
 
+                # Write the rescaled aircraft config (full copy, body-aligned landmarks).
+                if rescale:
+                    new_data = copy.deepcopy(aircraft_data)
+                    new_data["Aircraft_Mesh"][0] = _rescaled_mesh_cfg(
+                        mesh_cfg, mt["M_mesh2body"], mt["cob"])
+                    if isinstance(aircraft, str):
+                        if "_aircraft.json" in aircraft:
+                            rescaled_path = aircraft.replace("_aircraft.json", "_aircraft_rescaled.json")
+                        else:
+                            rescaled_path = aircraft.rsplit(".json", 1)[0] + "_rescaled.json"
+                        with open(rescaled_path, "w") as f:
+                            json.dump(new_data, f, indent=2)
+                    else:
+                        warnings.warn("rescale=True but aircraft given as dict; "
+                                      "cannot derive a rescaled-JSON output path.")
+
                 if output_video is None and route_path is not None:
                     output_video = route_path.replace("_trajectory.json", "_camera_view.mp4")
                 if output_video is not None:
                     mesh_data_for_video = {
                         "verts_centered": mt["verts_centered"],
                         "edges": mt["edges"],
-                        "R_mesh2ENU": R_mesh2ENU,
+                        "M_mesh2ENU": M_mesh2ENU,
                         "traj_ENU": traj_ENU,
-                        "scale": mt["scale"],
                         "cam_origin": cam_origin,
                     }
                     _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
@@ -814,6 +918,7 @@ if __name__ == "__main__":
     aircraft_cfg = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightCharacteristics/ABT4_aircraft.json"
     views = generate_camera_views(
         traj, battery=battery, gimbal=gimbal_path, lock_deltas=lock_deltas_path,
-        camera=camera_cfg, aircraft=aircraft_cfg)
+        camera=camera_cfg, aircraft=aircraft_cfg, output_json=None, output_video=None, gimbal_video=None,
+        output_combined=None, schematic_view=True, use_mesh=True, rescale=True)
     print(f"Generated {len(views['camera_view'])} camera-view frames.")
     print("First frame:", views["camera_view"][0])
