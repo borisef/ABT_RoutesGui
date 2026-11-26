@@ -1,0 +1,19 @@
+{
+  "_comment": "Aircraft object characteristics",
+  "Aircraft_Schema":
+  [
+    {
+      
+      "wingSpan":       10,
+      "bodyLength":        10,
+      "verticalTailHeight":    5,
+      "wingsToBodyRatio": 0.5
+    }
+  ],
+  "Aircraft_Mesh":
+  [
+    {
+      "mesh_path": "/home/borisef/projects/replayScenario/data/3D/plane.obj"
+    }
+  ]
+}

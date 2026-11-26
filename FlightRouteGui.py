@@ -816,7 +816,7 @@ class FlightRouteApp(tk.Tk):
         targets = {}
         for key, label in (("target_azimuth", "Turn to azimuth"),
                            ("target_altitude", "Level at altitude")):
-            text = self.target_vars[key.removeprefix("target_")].get().strip()
+            text = self.target_vars[key[len("target_"):]].get().strip()
             if not text:
                 continue
             try:

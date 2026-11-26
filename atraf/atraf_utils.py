@@ -1,4 +1,6 @@
 import json
+import os
+import warnings
 
 import numpy as np
 
@@ -310,10 +312,490 @@ def generate_camera_pose_video(route_json, battery_json=None, lock_deltas_json=N
     return output_path
 
 
+def _camera_intrinsics(camera_json):
+    """Return pinhole intrinsics (fx, fy, cx, cy, W, H) from a camera config.
+
+    Config fields: W, H (pixels) and FOV_H, FOV_V (full field of view, degrees).
+    Focal length in pixels is (size/2) / tan(fov/2).
+    """
+    cam = _load_json(camera_json)
+    W = float(cam["W"])
+    H = float(cam["H"])
+    fov_h = np.radians(float(cam["FOV_H"]))
+    fov_v = np.radians(float(cam["FOV_V"]))
+    fx = (W / 2.0) / np.tan(fov_h / 2.0)
+    fy = (H / 2.0) / np.tan(fov_v / 2.0)
+    return {"fx": fx, "fy": fy, "cx": W / 2.0, "cy": H / 2.0, "W": W, "H": H}
+
+
+def _aircraft_schema(aircraft_json):
+    """Return (wing_span, body_length, wings_to_body_ratio, vertical_tail_height)."""
+    data = _load_json(aircraft_json)
+    schema = data["Aircraft_Schema"][0] if "Aircraft_Schema" in data else data
+    return (float(schema["wingSpan"]), float(schema["bodyLength"]),
+            float(schema.get("wingsToBodyRatio", 0.5)),
+            float(schema.get("verticalTailHeight", 0.0)))
+
+
+def _aircraft_axes(yaw, pitch, roll):
+    """Return (forward, starboard, dorsal) each (n,3) ENU unit vectors from aircraft pose."""
+    psi = np.radians(np.asarray(yaw, float))
+    th = np.radians(np.asarray(pitch, float))
+    ph = np.radians(np.asarray(roll, float))
+
+    forward = np.stack([np.cos(th) * np.sin(psi), np.cos(th) * np.cos(psi), np.sin(th)], axis=1)
+    starboard = np.stack([
+        np.sin(ph) * np.sin(th) * np.sin(psi) + np.cos(ph) * np.cos(psi),
+        np.sin(ph) * np.sin(th) * np.cos(psi) - np.cos(ph) * np.sin(psi),
+        -np.sin(ph) * np.cos(th),
+    ], axis=1)
+    dorsal = np.stack([
+        np.sin(ph) * np.cos(psi) - np.cos(ph) * np.sin(th) * np.sin(psi),
+        -np.sin(ph) * np.sin(psi) - np.cos(ph) * np.sin(th) * np.cos(psi),
+        np.cos(ph) * np.cos(th),
+    ], axis=1)
+    return forward, starboard, dorsal
+
+
+def _aircraft_mesh(aircraft_json):
+    """Return Aircraft_Mesh config dict if present with required landmarks, else None."""
+    data = _load_json(aircraft_json)
+    if "Aircraft_Mesh" not in data:
+        return None
+    mesh_cfg = data["Aircraft_Mesh"][0]
+    required = ("left_wing", "right_wing", "nose", "tail", "center_of_body")
+    if not all(k in mesh_cfg for k in required):
+        return None
+    return mesh_cfg
+
+
+def _build_mesh_transform(mesh_cfg, wing_span):
+    """Compute static transform data for mesh rendering. Returns dict or None.
+
+    Derives scale from real-world wing_span vs mesh landmark span.
+    Derives axis mapping from nose/tail/wing landmark positions.
+    Loads OBJ vertices and builds a subsampled edge list for wireframe rendering.
+    """
+    from atraf.mesh_utils import _load_mesh, _faces_to_edges, _subsample_edges
+
+    cob = np.array(mesh_cfg["center_of_body"], float)
+    left = np.array(mesh_cfg["left_wing"], float)
+    right = np.array(mesh_cfg["right_wing"], float)
+    nose = np.array(mesh_cfg["nose"], float)
+    tail = np.array(mesh_cfg["tail"], float)
+    vtop = np.array(mesh_cfg.get("vertical_tail_top", mesh_cfg["tail"]), float)
+
+    span_mesh = np.linalg.norm(left - right)
+    body_mesh = np.linalg.norm(nose - tail)
+    if span_mesh < 1e-9 or body_mesh < 1e-9:
+        return None
+
+    scale = wing_span / span_mesh
+
+    forward_mesh = (nose - tail) / body_mesh
+    port_mesh = (left - right) / span_mesh
+    dorsal_mesh = np.cross(forward_mesh, port_mesh)
+    dn = np.linalg.norm(dorsal_mesh)
+    if dn < 1e-9:
+        return None
+    dorsal_mesh /= dn
+
+    # Rows: how each body axis (forward, port, dorsal) is expressed in mesh XYZ frame.
+    R_mesh2body = np.array([forward_mesh, port_mesh, dorsal_mesh])  # (3, 3)
+
+    verts, faces = _load_mesh(mesh_cfg["mesh_path"])
+    verts_centered = verts - cob
+
+    lmk_keys = ["nose", "tail", "left_wing", "right_wing", "tail_top", "center"]
+    lmk_src = [nose, tail, left, right, vtop, cob]
+    lmk_centered = np.array([v - cob for v in lmk_src], dtype=float)  # (6, 3)
+
+    edges = _subsample_edges(_faces_to_edges(faces))
+
+    return {
+        "scale": scale,
+        "R_mesh2body": R_mesh2body,
+        "verts_centered": verts_centered,
+        "lmk_centered": lmk_centered,
+        "lmk_keys": lmk_keys,
+        "edges": edges,
+    }
+
+
+def _mesh_project_landmarks(lmk_centered, R_mesh2ENU, traj_ENU, scale,
+                             cam_origin, forward, right, up, intr):
+    """Project the 6 mesh landmarks for all frames. Returns (verts_px, depths) dicts."""
+    # lmk_world: (n_frames, 6, 3)
+    lmk_world = traj_ENU[:, None, :] + scale * np.einsum("fij,nj->fni", R_mesh2ENU, lmk_centered)
+
+    lmk_keys = ["nose", "tail", "left_wing", "right_wing", "tail_top", "center"]
+    verts_px, depths = {}, {}
+    for k, name in enumerate(lmk_keys):
+        u, v, d = _project_vertices(lmk_world[:, k, :], cam_origin, forward, right, up, intr)
+        verts_px[name] = np.stack([u, v], axis=1)
+        depths[name] = d
+    return verts_px, depths
+
+
+def _camera_basis(az_deg, el_deg, roll_deg=0.0):
+    """Return per-frame camera axes (forward, right, up) as (n, 3) ENU arrays.
+
+    forward = boresight (East, North, Up); right = increasing-azimuth (horizontal);
+    up = increasing-elevation. Roll (degrees) rotates right/up about the boresight.
+    """
+    az = np.radians(np.atleast_1d(az_deg))
+    el = np.radians(np.atleast_1d(el_deg))
+    roll = np.radians(np.atleast_1d(roll_deg))
+    if roll.size == 1:
+        roll = np.full(az.shape, roll[0])
+
+    zero = np.zeros_like(az)
+    forward = np.stack([np.cos(el) * np.sin(az), np.cos(el) * np.cos(az), np.sin(el)], axis=1)
+    right = np.stack([np.cos(az), -np.sin(az), zero], axis=1)
+    up = np.stack([-np.sin(el) * np.sin(az), -np.sin(el) * np.cos(az), np.cos(el)], axis=1)
+
+    cr, sr = np.cos(roll)[:, None], np.sin(roll)[:, None]
+    right_r = cr * right + sr * up
+    up_r = -sr * right + cr * up
+    return forward, right_r, up_r
+
+
+def _aircraft_vertices(X, Y, Z, yaw, pitch, roll, wing_span, body_length, ratio,
+                       vertical_tail_height=0.0):
+    """Return the aircraft schematic vertices as a dict of (n, 3) ENU arrays.
+
+    The cross has a body (tail->nose) along the aircraft forward axis and wings
+    (left->right) along the starboard axis, meeting at `ratio` of the body length
+    from the tail (0 = tail, 1 = nose). A vertical tail rises from the tail along
+    the dorsal (up) axis. Forward/starboard/dorsal come from the standard aerospace
+    Yaw/Pitch/Roll (heading clockwise from North, pitch up, bank right), so the fin
+    leans with roll and pitch.
+    """
+    center = np.stack([np.asarray(X, float), np.asarray(Y, float), np.asarray(Z, float)], axis=1)
+    forward, starboard, dorsal = _aircraft_axes(yaw, pitch, roll)
+
+    tail = center - ratio * body_length * forward
+    return {
+        "nose": center + (1.0 - ratio) * body_length * forward,
+        "tail": tail,
+        "right_wing": center + (wing_span / 2.0) * starboard,
+        "left_wing": center - (wing_span / 2.0) * starboard,
+        "tail_top": tail + vertical_tail_height * dorsal,
+        "center": center,
+    }
+
+
+def _project_vertices(points_enu, cam_origin, forward, right, up, intr):
+    """Project (n, 3) ENU world points to (u, v) pixels. Returns (u, v, depth)."""
+    v = points_enu - cam_origin
+    depth = np.sum(v * forward, axis=1)
+    xc = np.sum(v * right, axis=1)
+    yc = np.sum(v * up, axis=1)
+    safe = np.where(depth != 0.0, depth, np.nan)
+    u = intr["cx"] + intr["fx"] * (xc / safe)
+    px_v = intr["cy"] - intr["fy"] * (yc / safe)
+    return u, px_v, depth
+
+
+def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
+                               output_video, fps=20, n_frames=200, mesh_data=None):
+    """Render the schematic camera image sequence to an MP4."""
+    import imageio_ffmpeg
+    import matplotlib
+    matplotlib.rcParams["animation.ffmpeg_path"] = imageio_ffmpeg.get_ffmpeg_exe()
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.animation import FFMpegWriter
+
+    W, H, cx, cy = intr["W"], intr["H"], intr["cx"], intr["cy"]
+    n = len(ids)
+    frame_idx = np.linspace(0, n - 1, min(n_frames, n)).astype(int)
+
+    fig = Figure(figsize=(6, 6.4))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(1, 1, 1)
+
+    # Pre-extract mesh data once outside the frame loop.
+    use_mesh_render = mesh_data is not None
+    if use_mesh_render:
+        from matplotlib.collections import LineCollection
+        md_verts = mesh_data["verts_centered"]    # (N, 3)
+        md_R = mesh_data["R_mesh2ENU"]            # (n_all, 3, 3)
+        md_traj = mesh_data["traj_ENU"]           # (n_all, 3)
+        md_scale = mesh_data["scale"]
+        md_cam = mesh_data["cam_origin"]          # (3,)
+        md_edges = mesh_data["edges"]             # (E_sub, 2)
+        i_idx = md_edges[:, 0] if len(md_edges) else np.array([], int)
+        j_idx = md_edges[:, 1] if len(md_edges) else np.array([], int)
+
+    title_mode = "mesh" if use_mesh_render else "schematic"
+    writer = FFMpegWriter(fps=fps, metadata={"title": f"Camera view ({title_mode})"})
+    with writer.saving(fig, output_video, dpi=100):
+        for i in frame_idx:
+            ax.clear()
+            ax.set_facecolor("black")
+            ax.set_xlim(0, W)
+            ax.set_ylim(H, 0)  # image row 0 at top
+            ax.set_aspect("equal")
+            # boresight crosshair
+            ax.axhline(cy, color="#444444", lw=0.8)
+            ax.axvline(cx, color="#444444", lw=0.8)
+
+            if use_mesh_render:
+                fwd_f, rgt_f, up_f = _camera_basis(az[i], el[i])
+                fwd_f, rgt_f, up_f = fwd_f[0], rgt_f[0], up_f[0]
+
+                # Transform all mesh vertices to world ENU for this frame.
+                world_f = md_traj[i] + md_scale * (md_R[i] @ md_verts.T).T  # (N, 3)
+
+                # Project to camera pixels.
+                diff = world_f - md_cam                          # (N, 3)
+                depth_f = diff @ fwd_f                           # (N,)
+                safe_d = np.where(depth_f != 0, depth_f, np.nan)
+                u_f = intr["cx"] + intr["fx"] * (diff @ rgt_f) / safe_d
+                v_f = intr["cy"] - intr["fy"] * (diff @ up_f) / safe_d
+
+                # Draw edges where both endpoints are in front of the camera.
+                if len(i_idx):
+                    vis = (depth_f[i_idx] > 0) & (depth_f[j_idx] > 0)
+                    i_v, j_v = i_idx[vis], j_idx[vis]
+                    if len(i_v):
+                        pts0 = np.stack([u_f[i_v], v_f[i_v]], axis=1)
+                        pts1 = np.stack([u_f[j_v], v_f[j_v]], axis=1)
+                        segs = np.stack([pts0, pts1], axis=1)
+                        ax.add_collection(LineCollection(segs, colors="#00e5ff",
+                                                         linewidths=0.5, alpha=0.7))
+
+                ax.plot(verts_px["nose"][i, 0], verts_px["nose"][i, 1],
+                        "o", color="#ff1744", ms=5, label="nose")
+                ax.plot(verts_px["center"][i, 0], verts_px["center"][i, 1],
+                        "o", color="white", ms=3)
+                ax.legend(loc="upper right", fontsize=8, facecolor="#222222", labelcolor="white")
+            else:
+                body = np.array([verts_px["tail"][i], verts_px["nose"][i]])
+                left_wing = np.array([verts_px["center"][i], verts_px["left_wing"][i]])
+                right_wing = np.array([verts_px["center"][i], verts_px["right_wing"][i]])
+                fin = np.array([verts_px["tail"][i], verts_px["tail_top"][i]])
+                ax.plot(body[:, 0], body[:, 1], color="#00e5ff", lw=2.0)
+                ax.plot(left_wing[:, 0], left_wing[:, 1], color="#76ff03", lw=2.0, label="left wing")
+                ax.plot(right_wing[:, 0], right_wing[:, 1], color="#ff9100", lw=2.0, label="right wing")
+                ax.plot(fin[:, 0], fin[:, 1], color="#ffd600", lw=2.0)
+                ax.plot(verts_px["nose"][i, 0], verts_px["nose"][i, 1], "o", color="#ff1744", ms=5)
+                ax.plot(verts_px["center"][i, 0], verts_px["center"][i, 1], "o", color="white", ms=3)
+                ax.legend(loc="upper right", fontsize=8, facecolor="#222222", labelcolor="white")
+
+            ax.set_xlabel("u [px]")
+            ax.set_ylabel("v [px]")
+            ax.set_title(
+                f"Camera view ({title_mode})  id={ids[i]}  t={times[i]:.2f} s\n"
+                f"Az={az[i]:.2f}°  El={el[i]:.2f}°   "
+                f"center offset=({offset_px[i, 0]:+.1f}, {offset_px[i, 1]:+.1f}) px",
+                fontsize=10)
+            fig.tight_layout()
+            writer.grab_frame()
+    return output_video
+
+
+def _join_videos_side_by_side(left_video, right_video, output_video, height=540):
+    """Scale both clips to a common height and stack them horizontally into one MP4.
+
+    Both inputs are produced at the same fps and frame count, so the panels stay
+    frame-synchronised. Uses the ffmpeg binary bundled with imageio-ffmpeg.
+    """
+    import subprocess
+    import imageio_ffmpeg
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    filtergraph = (f"[0:v]scale=-2:{height}[l];[1:v]scale=-2:{height}[r];"
+                   f"[l][r]hstack=inputs=2")
+    cmd = [ffmpeg, "-y", "-i", left_video, "-i", right_video,
+           "-filter_complex", filtergraph, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           output_video]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_video
+
+
+def generate_camera_views(trajectory, battery=None, gimbal=None, lock_deltas=None,
+                          camera=None, aircraft=None, output_json=None,
+                          output_video=None, gimbal_video=None, output_combined=None,
+                          schematic_view=True, use_mesh=True):
+    """Project the aircraft into camera pixels per frame.
+
+    When use_mesh=True (default) and the aircraft JSON contains an Aircraft_Mesh
+    section with landmark coordinates, the 3D OBJ mesh is loaded, scaled, and
+    projected as a wireframe. Otherwise the schematic cross (body + wings + fin)
+    is used. Both paths produce the same output format.
+
+    Inputs (paths or dicts): trajectory (required), camera + aircraft (required),
+    battery (camera altitude), gimbal (camera pose; computed from trajectory +
+    lock_deltas when omitted), lock_deltas (used only to compute the gimbal).
+
+    Writes XXX_camera_view.json (body/wing pixel coordinates per frame) and, when
+    requested, XXX_camera_view.mp4. When a gimbal-pose video exists (default
+    XXX_gimbal_pose.mp4, or `gimbal_video`), the two clips are joined side by side
+    into XXX_combined_view.mp4 (or `output_combined`).
+    """
+    if camera is None or aircraft is None:
+        raise ValueError("camera and aircraft configs are required.")
+
+    route_path = trajectory if isinstance(trajectory, str) else None
+    route_data = _load_json(trajectory)
+    pts = route_data["trajectory"]
+    ids = [p["id"] for p in pts]
+    X = np.array([p["X"] for p in pts])
+    Y = np.array([p["Y"] for p in pts])
+    Z = np.array([p["Z"] for p in pts])
+    yaw = np.array([p.get("Yaw", 0.0) for p in pts])
+    pitch = np.array([p.get("Pitch", 0.0) for p in pts])
+    roll = np.array([p.get("Roll", 0.0) for p in pts])
+    times = np.array([p.get("time_stamp", i) for i, p in enumerate(pts)])
+
+    cam_alt = _battery_altitude(_load_json(battery) if battery is not None else None)
+    cam_origin = np.array([0.0, 0.0, cam_alt])
+
+    # Camera pointing: gimbal pose if given, else computed from trajectory + lock_deltas.
+    if gimbal is not None:
+        gdata = _load_json(gimbal)
+        by_id = {g["id"]: g for g in gdata["gimbal_poses"]}
+        az = np.array([by_id[i]["azimute"] for i in ids])
+        el = np.array([by_id[i]["altitude"] for i in ids])
+        cam_roll = np.array([by_id[i].get("roll", 0.0) for i in ids], float)
+    else:
+        e_lock, n_lock, a_lock, _, _ = _camera_positions(route_data, battery, lock_deltas)
+        az, el = _gimbal_angles(e_lock, n_lock, a_lock, cam_alt)
+        cam_roll = np.zeros(len(ids))
+
+    intr = _camera_intrinsics(camera)
+    wing_span, body_length, ratio, tail_height = _aircraft_schema(aircraft)
+
+    forward, right, up = _camera_basis(az, el, cam_roll)
+
+    # --- Mesh rendering path (use_mesh=True and Aircraft_Mesh with landmarks present) ---
+    if use_mesh or not schematic_view:
+        mesh_cfg = _aircraft_mesh(aircraft)
+        if mesh_cfg is not None:
+            mt = None
+            try:
+                mt = _build_mesh_transform(mesh_cfg, wing_span)
+            except (IOError, OSError) as e:
+                warnings.warn(f"Cannot load mesh file ({e}); falling back to schematic.")
+            if mt is not None:
+                fwd_a, stb_a, dsl_a = _aircraft_axes(yaw, pitch, roll)
+                # Columns of R_body2ENU are ENU expressions of aircraft body axes.
+                R_body2ENU = np.stack([fwd_a, -stb_a, dsl_a], axis=2)   # (n, 3, 3)
+                R_mesh2ENU = R_body2ENU @ mt["R_mesh2body"]               # (n, 3, 3)
+                traj_ENU = np.stack([X, Y, Z], axis=1)                   # (n, 3)
+
+                verts_px, depths = _mesh_project_landmarks(
+                    mt["lmk_centered"], R_mesh2ENU, traj_ENU, mt["scale"],
+                    cam_origin, forward, right, up, intr)
+
+                offset_px = verts_px["center"] - np.array([intr["cx"], intr["cy"]])
+                in_w = (verts_px["center"][:, 0] >= 0) & (verts_px["center"][:, 0] < intr["W"])
+                in_h = (verts_px["center"][:, 1] >= 0) & (verts_px["center"][:, 1] < intr["H"])
+                visible = in_w & in_h & (depths["center"] > 0)
+
+                frames = []
+                for k, pid in enumerate(ids):
+                    frames.append({
+                        "id": pid,
+                        "nose": [round(float(verts_px["nose"][k, 0]), 2), round(float(verts_px["nose"][k, 1]), 2)],
+                        "tail": [round(float(verts_px["tail"][k, 0]), 2), round(float(verts_px["tail"][k, 1]), 2)],
+                        "left_wing": [round(float(verts_px["left_wing"][k, 0]), 2), round(float(verts_px["left_wing"][k, 1]), 2)],
+                        "right_wing": [round(float(verts_px["right_wing"][k, 0]), 2), round(float(verts_px["right_wing"][k, 1]), 2)],
+                        "tail_top": [round(float(verts_px["tail_top"][k, 0]), 2), round(float(verts_px["tail_top"][k, 1]), 2)],
+                        "center": [round(float(verts_px["center"][k, 0]), 2), round(float(verts_px["center"][k, 1]), 2)],
+                        "visible": bool(visible[k]),
+                    })
+                result = {"camera_view": frames}
+
+                if output_json is None:
+                    if route_path is None:
+                        raise ValueError("output_json must be provided when trajectory is a dict")
+                    output_json = route_path.replace("_trajectory.json", "_camera_view.json")
+                with open(output_json, "w") as f:
+                    json.dump(result, f, indent=2)
+
+                if output_video is None and route_path is not None:
+                    output_video = route_path.replace("_trajectory.json", "_camera_view.mp4")
+                if output_video is not None:
+                    mesh_data_for_video = {
+                        "verts_centered": mt["verts_centered"],
+                        "edges": mt["edges"],
+                        "R_mesh2ENU": R_mesh2ENU,
+                        "traj_ENU": traj_ENU,
+                        "scale": mt["scale"],
+                        "cam_origin": cam_origin,
+                    }
+                    _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
+                                               output_video, mesh_data=mesh_data_for_video)
+                    if gimbal_video is None and route_path is not None:
+                        gimbal_video = route_path.replace("_trajectory.json", "_gimbal_pose.mp4")
+                    if output_combined is None and route_path is not None:
+                        output_combined = route_path.replace("_trajectory.json", "_combined_view.mp4")
+                    if gimbal_video and os.path.isfile(gimbal_video) and output_combined:
+                        _join_videos_side_by_side(gimbal_video, output_video, output_combined)
+
+                return result
+
+    # --- Schematic rendering path (fallback) ---
+    verts_enu = _aircraft_vertices(X, Y, Z, yaw, pitch, roll, wing_span, body_length,
+                                   ratio, tail_height)
+
+    verts_px, depths = {}, {}
+    for name, p_enu in verts_enu.items():
+        u, v, d = _project_vertices(p_enu, cam_origin, forward, right, up, intr)
+        verts_px[name] = np.stack([u, v], axis=1)
+        depths[name] = d
+
+    offset_px = verts_px["center"] - np.array([intr["cx"], intr["cy"]])
+
+    in_w = (verts_px["center"][:, 0] >= 0) & (verts_px["center"][:, 0] < intr["W"])
+    in_h = (verts_px["center"][:, 1] >= 0) & (verts_px["center"][:, 1] < intr["H"])
+    visible = in_w & in_h & (depths["center"] > 0)
+
+    frames = []
+    for k, pid in enumerate(ids):
+        frames.append({
+            "id": pid,
+            "nose": [round(float(verts_px["nose"][k, 0]), 2), round(float(verts_px["nose"][k, 1]), 2)],
+            "tail": [round(float(verts_px["tail"][k, 0]), 2), round(float(verts_px["tail"][k, 1]), 2)],
+            "left_wing": [round(float(verts_px["left_wing"][k, 0]), 2), round(float(verts_px["left_wing"][k, 1]), 2)],
+            "right_wing": [round(float(verts_px["right_wing"][k, 0]), 2), round(float(verts_px["right_wing"][k, 1]), 2)],
+            "tail_top": [round(float(verts_px["tail_top"][k, 0]), 2), round(float(verts_px["tail_top"][k, 1]), 2)],
+            "center": [round(float(verts_px["center"][k, 0]), 2), round(float(verts_px["center"][k, 1]), 2)],
+            "visible": bool(visible[k]),
+        })
+    result = {"camera_view": frames}
+
+    if output_json is None:
+        if route_path is None:
+            raise ValueError("output_json must be provided when trajectory is a dict")
+        output_json = route_path.replace("_trajectory.json", "_camera_view.json")
+    with open(output_json, "w") as f:
+        json.dump(result, f, indent=2)
+
+    if output_video is None and route_path is not None:
+        output_video = route_path.replace("_trajectory.json", "_camera_view.mp4")
+    if output_video is not None:
+        _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
+                                   output_video)
+
+        # Join the gimbal-pose video and this camera view side by side when available.
+        if gimbal_video is None and route_path is not None:
+            gimbal_video = route_path.replace("_trajectory.json", "_gimbal_pose.mp4")
+        if output_combined is None and route_path is not None:
+            output_combined = route_path.replace("_trajectory.json", "_combined_view.mp4")
+        if gimbal_video and os.path.isfile(gimbal_video) and output_combined:
+            _join_videos_side_by_side(gimbal_video, output_video, output_combined)
+
+    return result
+
+
 if __name__ == "__main__":
-    traj = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightInstructions/TEST3_trajectory.json"
-    extra = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightCharacteristics/ABT0_extra.json"
-    battery = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightInstructions/TEST3_battery.json"
+    traj = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightInstructions/TEST4_trajectory.json"
+    extra = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightCharacteristics/ABT4_extra.json"
+    battery = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightInstructions/TEST4_battery.json"
 
     deltas = generate_lock_deltas(traj, extra)
     print(f"Generated {len(deltas['trajectory'])} lock delta entries.")
@@ -326,3 +808,12 @@ if __name__ == "__main__":
 
     video = generate_camera_pose_video(traj, battery_json=battery, lock_deltas_json=lock_deltas_path)
     print("Saved video:", video)
+
+    gimbal_path = traj.replace("_trajectory.json", "_gimbal_pose.json")
+    camera_cfg = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightCharacteristics/ABT4_camera.json"
+    aircraft_cfg = "/home/borisef/projects/ABT_RoutesGui/ABT_FlightCharacteristics/ABT4_aircraft.json"
+    views = generate_camera_views(
+        traj, battery=battery, gimbal=gimbal_path, lock_deltas=lock_deltas_path,
+        camera=camera_cfg, aircraft=aircraft_cfg)
+    print(f"Generated {len(views['camera_view'])} camera-view frames.")
+    print("First frame:", views["camera_view"][0])
