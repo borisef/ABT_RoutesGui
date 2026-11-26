@@ -586,6 +586,17 @@ def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
         i_idx = md_edges[:, 0] if len(md_edges) else np.array([], int)
         j_idx = md_edges[:, 1] if len(md_edges) else np.array([], int)
 
+        # One distinct color per keypoint; every keypoint is shown in the legend.
+        kp_colors = {
+            "nose": "#ff1744", "tail": "#2979ff",
+            "left_wing": "#76ff03", "right_wing": "#ff9100",
+            "tail_top": "#ffd600", "center": "#ffffff", "wing_root": "#e040fb",
+            "left_horizontal_stabilizer": "#ff80ab",
+            "right_horizontal_stabilizer": "#40c4ff",
+        }
+        kp_fallback = ["#00e5ff", "#f50057", "#64dd17", "#ffab00",
+                       "#d500f9", "#1de9b6", "#ff6e40"]
+
     title_mode = "mesh" if use_mesh_render else "schematic"
     writer = FFMpegWriter(fps=fps, metadata={"title": f"Camera view ({title_mode})"})
     with writer.saving(fig, output_video, dpi=100):
@@ -637,18 +648,16 @@ def _render_camera_views_video(verts_px, intr, ids, times, az, el, offset_px,
                 ax.plot(right_wing[:, 0], right_wing[:, 1], color="#ff9100", lw=2.6, zorder=4)
                 ax.plot(fin[:, 0], fin[:, 1], color="#ffd600", lw=2.2, zorder=4)
 
-                # All mesh keypoints: 4 prime points in distinct colors, the rest
-                # (center, fin tip, stabilizers, wing root, ...) in a common gray.
-                prime_colors = {"nose": "#ff1744", "tail": "#2979ff",
-                                "left_wing": "#76ff03", "right_wing": "#ff9100"}
+                # Every keypoint in its own distinct color, each in the legend.
+                fb = 0
                 for name, pt in verts_px.items():
-                    if name in prime_colors:
-                        continue
-                    ax.plot(pt[i, 0], pt[i, 1], "o", color="#9e9e9e", ms=3, zorder=5)
-                for name, col in prime_colors.items():
-                    ax.plot(verts_px[name][i, 0], verts_px[name][i, 1], "o", color=col,
-                            ms=6, zorder=6, label=name.replace("_", " "))
-                ax.legend(loc="upper right", fontsize=8, facecolor="#222222", labelcolor="white")
+                    col = kp_colors.get(name)
+                    if col is None:
+                        col = kp_fallback[fb % len(kp_fallback)]
+                        fb += 1
+                    ax.plot(pt[i, 0], pt[i, 1], "o", color=col, ms=6, zorder=6,
+                            label=name.replace("_", " "))
+                ax.legend(loc="upper right", fontsize=7, facecolor="#222222", labelcolor="white")
             else:
                 body = np.array([verts_px["tail"][i], verts_px["nose"][i]])
                 left_wing = np.array([verts_px["center"][i], verts_px["left_wing"][i]])
